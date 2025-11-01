@@ -16,7 +16,7 @@ torch.set_num_threads(os.cpu_count())
 
 # ==================== Configuration ====================
 
-DATA_DIR = '/Users/wynndiaz/Yi He Laboratory/GluttonData'
+DATA_DIR = '/Users/wynndiaz//Data'
 CSV_FILES = ['1.csv', '2.csv', '3.csv']
 BATCH_SIZE = 2048
 EPOCHS = 150
