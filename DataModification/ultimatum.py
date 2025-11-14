@@ -92,22 +92,15 @@ def _build_shared_from_list(data, metadata):
     n_samples = len(data)
     max_atoms = max(s['n_atoms'] for s in data)
 
-    # Shared tensors: shape [n_samples, max_atoms, ...]
-    atom_type = torch.empty((n_samples, max_atoms), dtype=torch.long).share_memory_()
-    atom_name = torch.empty((n_samples, max_atoms), dtype=torch.long).share_memory_()
-    residue_type = torch.empty((n_samples, max_atoms), dtype=torch.long).share_memory_()
-    ss_type = torch.empty((n_samples, max_atoms), dtype=torch.long).share_memory_()
-    relative_position = torch.empty((n_samples, max_atoms), dtype=torch.long).share_memory_()
-
-    coords = torch.empty((n_samples, max_atoms, 3), dtype=torch.float32).share_memory_()
-    phi = torch.empty((n_samples, max_atoms), dtype=torch.float32).share_memory_()
-    psi = torch.empty((n_samples, max_atoms), dtype=torch.float32).share_memory_()
-
-    cs_normalized = torch.empty((n_samples, max_atoms), dtype=torch.float32).share_memory_()
-    cs_err_normalized = torch.empty((n_samples, max_atoms), dtype=torch.float32).share_memory_()
-    cs_mask = torch.empty((n_samples, max_atoms), dtype=torch.bool).share_memory_()
-    coords_mask = torch.empty((n_samples, max_atoms), dtype=torch.bool).share_memory_()
-
+    # Pack related features into a few large shared tensors to reduce the number
+    # of shared-memory segments (and thus open file descriptors).
+    # int_features: [atom_type, atom_name, residue_type, ss_type, relative_position]
+    int_features = torch.empty((n_samples, max_atoms, 5), dtype=torch.long).share_memory_()
+    # float_features: [coord_x, coord_y, coord_z, phi, psi, cs_normalized, cs_err_normalized]
+    float_features = torch.empty((n_samples, max_atoms, 7), dtype=torch.float32).share_memory_()
+    # bool_features: [cs_mask, coords_mask]
+    bool_features = torch.empty((n_samples, max_atoms, 2), dtype=torch.bool).share_memory_()
+    # distance matrix stays as its own tensor
     distance_matrix = torch.empty((n_samples, max_atoms, max_atoms), dtype=torch.float32).share_memory_()
     n_atoms_tensor = torch.empty((n_samples,), dtype=torch.int32).share_memory_()
 
@@ -119,45 +112,42 @@ def _build_shared_from_list(data, metadata):
         n_atoms = sample['n_atoms']
         n_atoms_tensor[i] = n_atoms
 
-        # Create views for this sample
-        at = atom_type[i, :n_atoms]
-        an = atom_name[i, :n_atoms]
-        rt = residue_type[i, :n_atoms]
-        ss = ss_type[i, :n_atoms]
-        rp = relative_position[i, :n_atoms]
-
-        c = coords[i, :n_atoms]
-        ph = phi[i, :n_atoms]
-        ps = psi[i, :n_atoms]
-
-        cs_n = cs_normalized[i, :n_atoms]
-        cs_e = cs_err_normalized[i, :n_atoms]
-        cs_m = cs_mask[i, :n_atoms]
-        cm = coords_mask[i, :n_atoms]
+        # Create views for this sample from packed tensors
+        int_feat = int_features[i, :n_atoms]      # shape [n_atoms, 5]
+        float_feat = float_features[i, :n_atoms]  # shape [n_atoms, 7]
+        bool_feat = bool_features[i, :n_atoms]    # shape [n_atoms, 2]
 
         dm = distance_matrix[i, :n_atoms, :n_atoms]
 
-        # Copy categorical / indices
-        at.copy_(torch.as_tensor(sample['atom_type'], dtype=torch.long))
-        an.copy_(torch.as_tensor(sample['atom_name'], dtype=torch.long))
-        rt.copy_(torch.as_tensor(sample['residue_type'], dtype=torch.long))
-        ss.copy_(torch.as_tensor(sample['ss_type'], dtype=torch.long))
-        rp.copy_(torch.as_tensor(sample['relative_position'], dtype=torch.long))
+        # Copy categorical / indices into int_features
+        at = torch.as_tensor(sample['atom_type'], dtype=torch.long)
+        an = torch.as_tensor(sample['atom_name'], dtype=torch.long)
+        rt = torch.as_tensor(sample['residue_type'], dtype=torch.long)
+        ss = torch.as_tensor(sample['ss_type'], dtype=torch.long)
+        rp = torch.as_tensor(sample['relative_position'], dtype=torch.long)
+        int_feat[:, 0].copy_(at)
+        int_feat[:, 1].copy_(an)
+        int_feat[:, 2].copy_(rt)
+        int_feat[:, 3].copy_(ss)
+        int_feat[:, 4].copy_(rp)
 
         # Normalize coordinates
         coords_np = sample['coords'].astype(np.float32, copy=True)
         coords_m = sample['coords_mask']
         coords_np[coords_m] = (coords_np[coords_m] - stats['coords_mean']) / (stats['coords_std'] + 1e-8)
-        c.copy_(torch.from_numpy(coords_np))
-        cm.copy_(torch.from_numpy(coords_m.astype(bool)))
 
         # Normalize angles
         phi_np = ((sample['phi'] - stats['phi_mean']) / (stats['phi_std'] + 1e-8)).astype(np.float32)
         psi_np = ((sample['psi'] - stats['psi_mean']) / (stats['psi_std'] + 1e-8)).astype(np.float32)
-        ph.copy_(torch.from_numpy(phi_np))
-        ps.copy_(torch.from_numpy(psi_np))
 
-        # Normalize CS per atom type (vectorized over atom names)
+        # Write float features: [coord_x, coord_y, coord_z, phi, psi, cs_normalized, cs_err_normalized]
+        float_feat[:, 0].copy_(torch.from_numpy(coords_np[:, 0]))
+        float_feat[:, 1].copy_(torch.from_numpy(coords_np[:, 1]))
+        float_feat[:, 2].copy_(torch.from_numpy(coords_np[:, 2]))
+        float_feat[:, 3].copy_(torch.from_numpy(phi_np))
+        float_feat[:, 4].copy_(torch.from_numpy(psi_np))
+
+        # CS normalization
         cs_vals = sample['cs_values'].astype(np.float32)
         cs_errs = sample['cs_errors'].astype(np.float32)
         cs_m_np = sample['cs_mask'].astype(bool)
@@ -181,9 +171,11 @@ def _build_shared_from_list(data, metadata):
             cs_n_np[mask] = (cs_vals[mask] - mean) / std
             cs_e_np[mask] = cs_errs[mask] / std
 
-        cs_n.copy_(torch.from_numpy(cs_n_np))
-        cs_e.copy_(torch.from_numpy(cs_e_np))
-        cs_m.copy_(torch.from_numpy(cs_m_np))
+        # Write CS and masks into packed tensors
+        float_feat[:, 5].copy_(torch.from_numpy(cs_n_np))
+        float_feat[:, 6].copy_(torch.from_numpy(cs_e_np))
+        bool_feat[:, 0].copy_(torch.from_numpy(cs_m_np.astype(bool)))
+        bool_feat[:, 1].copy_(torch.from_numpy(coords_m.astype(bool)))
 
         # Normalize distance matrix
         dist = sample['distance_matrix'].astype(np.float32, copy=True)
@@ -192,42 +184,23 @@ def _build_shared_from_list(data, metadata):
         dist = np.clip(dist, 0, 10)
         dm.copy_(torch.from_numpy(dist))
 
-        # center_indices: keep as variable-length per-sample tensor (small)
-        center_indices_all.append(torch.as_tensor(sample['center_indices'], dtype=torch.long))
+        # center_indices (remains as Python list)
+        center_indices_all.append(sample['center_indices'])
 
         atom_name_str_all.append(sample['atom_name_str'])
 
         # Zero-pad tail if this sample has fewer than max_atoms
         if n_atoms < max_atoms:
-            atom_type[i, n_atoms:].zero_()
-            atom_name[i, n_atoms:].zero_()
-            residue_type[i, n_atoms:].zero_()
-            ss_type[i, n_atoms:].zero_()
-            relative_position[i, n_atoms:].zero_()
-
-            coords[i, n_atoms:].zero_()
-            phi[i, n_atoms:].zero_()
-            psi[i, n_atoms:].zero_()
-            cs_normalized[i, n_atoms:].zero_()
-            cs_err_normalized[i, n_atoms:].zero_()
-            cs_mask[i, n_atoms:] = False
-            coords_mask[i, n_atoms:] = False
+            int_features[i, n_atoms:].zero_()
+            float_features[i, n_atoms:].zero_()
+            bool_features[i, n_atoms:] = False
             distance_matrix[i, n_atoms:, :].zero_()
             distance_matrix[i, :, n_atoms:].zero_()
 
     return {
-        'atom_type': atom_type,
-        'atom_name': atom_name,
-        'residue_type': residue_type,
-        'ss_type': ss_type,
-        'relative_position': relative_position,
-        'coords': coords,
-        'phi': phi,
-        'psi': psi,
-        'cs_normalized': cs_normalized,
-        'cs_err_normalized': cs_err_normalized,
-        'cs_mask': cs_mask,
-        'coords_mask': coords_mask,
+        'int_features': int_features,
+        'float_features': float_features,
+        'bool_features': bool_features,
         'distance_matrix': distance_matrix,
         'center_indices': center_indices_all,
         'n_atoms': n_atoms_tensor,
@@ -482,20 +455,24 @@ class AtomDataset(Dataset):
         sh = self.shared
         n_atoms = int(sh['n_atoms'][idx])
 
-        atom_type = sh['atom_type'][idx, :n_atoms]
-        atom_name = sh['atom_name'][idx, :n_atoms]
-        residue_type = sh['residue_type'][idx, :n_atoms]
-        ss_type = sh['ss_type'][idx, :n_atoms]
-        relative_position = sh['relative_position'][idx, :n_atoms]
+        int_feat = sh['int_features'][idx, :n_atoms]      # [n_atoms, 5]
+        float_feat = sh['float_features'][idx, :n_atoms]  # [n_atoms, 7]
+        bool_feat = sh['bool_features'][idx, :n_atoms]    # [n_atoms, 2]
 
-        coords = sh['coords'][idx, :n_atoms]
-        phi = sh['phi'][idx, :n_atoms]
-        psi = sh['psi'][idx, :n_atoms]
+        atom_type = int_feat[:, 0]
+        atom_name = int_feat[:, 1]
+        residue_type = int_feat[:, 2]
+        ss_type = int_feat[:, 3]
+        relative_position = int_feat[:, 4]
 
-        cs_norm = sh['cs_normalized'][idx, :n_atoms]
-        cs_err_norm = sh['cs_err_normalized'][idx, :n_atoms]
-        cs_mask = sh['cs_mask'][idx, :n_atoms]
-        coords_mask = sh['coords_mask'][idx, :n_atoms]
+        coords = float_feat[:, 0:3]
+        phi = float_feat[:, 3]
+        psi = float_feat[:, 4]
+        cs_norm = float_feat[:, 5]
+        cs_err_norm = float_feat[:, 6]
+
+        cs_mask = bool_feat[:, 0]
+        coords_mask = bool_feat[:, 1]
 
         dist = sh['distance_matrix'][idx, :n_atoms, :n_atoms]
         center_idx = sh['center_indices'][idx]
